@@ -1,0 +1,46 @@
+---
+experiment_id: test-exp-001
+target_repo: PLACEHOLDER
+base_commit: HEAD
+scope:
+  allowed_paths: [src/**]
+  forbidden_paths: [.github/**, '*.lock']
+  max_files_changed: 5
+  max_loc_delta: 400
+goal: Improve fibonacci computation speed while maintaining all tests
+target_metric: fib_rps
+metric_direction: higher
+tiers:
+  - tier: 0
+    steps:
+      - name: syntax
+        command: python -m py_compile src/fib.py
+        timeout_s: 30
+  - tier: 1
+    steps:
+      - name: tests
+        command: python -m pytest tests/ -x --tb=short
+        timeout_s: 120
+  - tier: 2
+    steps:
+      - name: benchmark
+        command: bash bench.sh
+        timeout_s: 300
+gates:
+  - name: syntax_ok
+    tier: 0
+  - name: tests_pass
+    tier: 1
+reward:
+  patch_size_penalty: 0.01
+budget:
+  max_iterations: 2
+  max_candidates_per_iteration: 1
+  max_wall_clock_hours: 1.0
+  max_api_cost_usd: 5.0
+baseline:
+  runs: 3
+claude:
+  allowed_tools: Read,Edit,Bash(git diff *),Glob,Grep
+  max_turns: 10
+archive_dir: archive/test-exp-001
