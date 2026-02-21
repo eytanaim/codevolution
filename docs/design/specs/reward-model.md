@@ -8,15 +8,13 @@ This separation is the single most important design decision in the reward syste
 
 ## Why separate gates from reward?
 
-If you penalize-but-allow critical failures, the optimizer will eventually
-find candidates that score high reward while barely skirting failure boundaries.
-Gates eliminate this: you either pass or you're out. No negotiation.
-
-Reward only matters among candidates that already cleared all gates.
+If you penalize-but-allow critical failures, the optimizer will find candidates
+that score high reward while barely skirting failure boundaries.
+Gates eliminate this: you either pass or you're out.
 
 ## Hard gates
 
-Gates are defined per experiment. Template:
+Gates are defined per experiment:
 
 ```yaml
 gates:
@@ -28,98 +26,62 @@ gates:
     tier: 1
     condition: "tests.failed == 0"
 
-  - name: no_security_regressions
-    tier: 1
-    condition: "security.new_high_severity == 0"
-
   - name: no_forbidden_edits
     tier: 0
     condition: "patch.forbidden_files_touched == 0"
-
-  - name: no_perf_regression
-    tier: 2
-    condition: "perf.p95_delta_pct > -2.0"
-
-  - name: no_memory_regression
-    tier: 2
-    condition: "memory.peak_delta_pct > -5.0"
 ```
 
 A single gate failure = candidate rejected. Full stop.
 
+Gates map naturally to evaluation tiers:
+- Tier 0 gates: build, lint, patch policy
+- Tier 1 gates: tests pass, no security regressions
+- Tier 2 gates: no regression on target metric beyond threshold
+
 ## Scalar reward
 
-Used only for ranking gate-passing candidates.
+Used only for ranking gate-passing candidates. Keep it simple in v1.
 
-### Template formula
+### v1 formula
 
 ```
-R = w_correct * correctness_score
-  + w_perf    * perf_gain_normalized
-  + w_rely    * reliability_gain_normalized
-  + w_maint   * maintainability_gain_normalized
-  - w_size    * patch_size_penalty
-  - w_risk    * risk_penalty
-  - w_cost    * eval_cost_penalty
+reward = metric_improvement_pct - patch_size_penalty
 ```
 
-Weights are set per experiment goal. The structure stays constant.
+Where:
+- `metric_improvement_pct` = % improvement over baseline on target metric
+- `patch_size_penalty` = small multiplier on LOC changed (discourages bloat)
 
-### Normalization
+That's it. One metric, one penalty. Start here.
 
-Raw metrics have different scales. Normalize before combining:
-- **% improvement over baseline** for bounded metrics
-- **z-score** for noisy metrics (using baseline variance)
-- **Clipped deltas** to prevent outliers from dominating
+### Why not a weighted multi-metric formula?
 
-### Penalties
+The original design had 7 weighted components (correctness, perf, reliability,
+maintainability, risk, cost penalties). This is premature:
+- You need data to set weights
+- Multi-metric formulas create unexpected interactions
+- Debugging "why did this candidate rank higher" becomes hard
 
-Without penalties, the optimizer gravitates toward huge rewrites.
+Start with one target metric. Add dimensions when you understand the landscape.
 
-- **patch_size_penalty**: scales with LOC changed (encourages surgical changes)
-- **risk_penalty**: flags for patterns like broad refactors, dependency changes
-- **eval_cost_penalty**: tokens + compute used (encourages efficiency)
+### When to add complexity
 
-### Confidence adjustment
-
-If a metric measurement is noisy (high variance across runs):
-- Discount its contribution by confidence
-- Or: use lower bound of confidence interval instead of point estimate
-
-This prevents "lucky" candidates from ranking high on noise.
-
-## Reward schema (per experiment config)
-
-```yaml
-reward:
-  weights:
-    correctness: 100
-    performance: 30
-    reliability: 10
-    maintainability: 5
-  penalties:
-    patch_size: 10
-    risk: 15
-    eval_cost: 5
-  normalization: "pct_improvement"  # or "z_score"
-  confidence_adjustment: true
-```
-
-Weights are placeholders - tuned per goal. The schema is the invariant.
+Add a second reward dimension when:
+- You have 50+ archive entries and can analyze trade-offs
+- The single metric is clearly insufficient (e.g., speed improves but memory regresses)
+- You can justify each weight with data
 
 ## Anti-Goodhart measures
 
 > "When a measure becomes a target, it ceases to be a good measure."
 
-- **Holdout evaluations** in Tier 3 that the agent doesn't see during optimization
-- **Reward formula is frozen** during an experiment run (no mid-run tweaks)
-- **Multiple independent metrics** prevent single-metric gaming
 - **Patch policy checks** catch structural gaming (disabled tests, benchmark conditionals)
+- **Reward formula is frozen** during an experiment run
 - **Human review** of promoted candidates catches semantic gaming
+- **Baseline comparison**: always compare against "ask Claude N times, pick best" (IID RS)
 
 ## Tie-breaking
 
 When candidates have equal reward:
 1. Prefer smaller patch (less risk)
-2. Prefer higher confidence (lower variance)
-3. Prefer newer (more recent parent = more context)
+2. Prefer newer (more recent iteration)

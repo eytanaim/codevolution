@@ -1,103 +1,42 @@
 # Selection Spec
 
-The selector decides what to try next. It's the system's "brain stem" -
-not fancy, but critical for making progress.
+How the system decides what to try next.
 
-## Core concept: Frontier
+## v1: Sequential Conditioned Sampling (SCS)
 
-The frontier is the set of top K candidates that are alive for further exploration.
-Think of it as a beam in beam search.
+The selector in v1 is deliberately simple:
 
-```
-All attempts ──> Archive (everything stored)
-                    │
-                    ▼
-              Gate-passing ──> Ranked by reward
-                                    │
-                                    ▼
-                              Top K = Frontier
-```
+1. Look at archive: find the **best gate-passing candidate so far**
+2. Include its diff and metrics as context for the next generation
+3. Include recent failures and their reasons as anti-patterns
+4. Generate the next batch
 
-**Frontier size K**: 8 (default)
+That's it. No frontier, no population, no epsilon-greedy.
 
-Why not just keep the single best? Because one wrong reward signal can trap
-the entire search. A frontier of K gives resilience to noise.
+### Why this works
 
-## Parent selection
+The ["Simple Baselines" paper](https://arxiv.org/html/2602.16805) (Feb 2025) showed
+that SCS matches or beats sophisticated evolutionary systems (AlphaEvolve, AIDE)
+on most tasks. The key insight: **conditioning on prior successes via the LLM's
+context window is already a powerful form of selection.**
 
-Each iteration, the selector picks parents from the frontier to generate candidates from.
+The LLM doesn't need a formal selection algorithm - it needs good context.
 
-### v1: Epsilon-greedy over frontier
+## What goes into "conditioning"
+
+Each iteration, the context builder provides:
 
 ```
-with probability (1 - epsilon):
-    pick from top 3 by reward (exploit)
-with probability epsilon:
-    pick uniformly from frontier (explore)
-
-epsilon = 0.15
+1. The goal (what we're optimizing for)
+2. The best candidate so far (diff + metrics)
+3. The 2-3 most recent failures (what went wrong)
+4. Constraints (what's allowed, what's forbidden)
 ```
 
-### Diversity enforcement
+This is the SCS "selection" mechanism. It works because the LLM can
+synthesize patterns from successful attempts and avoid patterns from failures.
 
-To prevent the search from collapsing:
-- Same parent can't be picked more than 3 consecutive times
-- Same intent can't be more than 60% of a batch
-- At least 2 distinct parents per iteration (if frontier size allows)
-
-## Candidate generation per iteration
-
-Per iteration, generate N candidates:
-
-```
-N = 8 (default)
-```
-
-Distributed across:
-- Multiple parents (2-4 from frontier)
-- Multiple strategies (from the portfolio)
-- Multiple granularities (XS through L)
-
-This ensures diversity of exploration per iteration.
-
-## Frontier update
-
-After evaluation:
-
-1. New gate-passing candidates are scored
-2. Combined with existing frontier
-3. Re-ranked by reward
-4. Top K survive
-5. Evicted candidates stay in archive but leave the frontier
-
-**No candidate re-enters the frontier once evicted** (prevents oscillation).
-
-## Convergence mechanics
-
-### Problem: Getting stuck in local optima
-
-Small patches exploit well but can't escape local optima.
-Large patches explore but are noisy and often fail gates.
-
-### Solution: Mixed granularity per iteration
-
-| Granularity | Share | Purpose |
-|-------------|-------|---------|
-| XS/S        | 50%   | Exploit current best |
-| M           | 35%   | Escape shallow optima |
-| L           | 15%   | Occasional larger jumps |
-
-### Problem: Reward plateau
-
-When the frontier stops improving for multiple iterations.
-
-### Solution: Plateau detection + response
-
-If no frontier improvement for 3 consecutive iterations:
-1. Increase exploration rate (epsilon → 0.3)
-2. Shift granularity mix toward larger patches
-3. Try strategies not recently used
-4. If plateau persists for 5 more iterations: flag for human review
+See [Context Engineering spec](context-engineering.md) for full details.
 
 ## Budget enforcement
 
@@ -105,24 +44,39 @@ The selector respects hard budgets:
 
 ```yaml
 budget:
-  max_iterations: 25
+  max_iterations: 20
+  max_candidates_per_iteration: 4
   max_wall_clock_hours: 4
   max_api_cost_usd: 50.0
-  max_total_tokens: 2_000_000
 ```
 
-When any budget is hit, the run stops gracefully:
+When any budget is hit, the run stops:
 - Current iteration completes
-- Final frontier is archived
-- Summary report generated
+- Final archive state is preserved
+- Best candidate is flagged for human review
 
-## v2 upgrade: Contextual bandit
+## Baseline comparison (always)
 
-Once the archive has enough data, the selector can learn:
-- Which strategies work best for the current goal type
-- Which granularities produce frontier candidates
-- Which parents are "fertile" (produce successful children)
-- Expected improvement per eval dollar spent
+Every experiment should compare against:
 
-This turns the selector from a static policy into an adaptive one.
-But v1 works without it.
+- **Baseline 0**: Current code, no changes (the zero point)
+- **Baseline 1**: Ask Claude N times independently, pick best (IID Random Sampling)
+- **Your system's result**: SCS with feedback
+
+If SCS can't beat IID RS consistently, the feedback loop isn't working
+and you should debug your context builder, not add more search machinery.
+
+## When to upgrade to evolutionary selection (v2+)
+
+Add frontier/population-based selection when you observe:
+
+1. **Plateau**: Reward stops improving for 5+ iterations despite good feedback
+2. **Diversity collapse**: All candidates converge to similar patches
+3. **Noisy rewards**: Single-best selection is unstable due to metric variance
+
+Upgrade path:
+- v2: Keep top K=3 candidates instead of just best (mini-frontier)
+- v3: Add diversity enforcement (don't use same parent consecutively)
+- v4: Full population-based selection with MAP-Elites
+
+Each step is justified by data, not speculation.

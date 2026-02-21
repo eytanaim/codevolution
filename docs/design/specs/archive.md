@@ -1,128 +1,103 @@
 # Archive Spec
 
-The archive is the system's memory. Every attempt is recorded with full context.
-Without it, the system is a goldfish - unable to learn from history or avoid repeating failures.
+The archive is the system's memory. Every attempt is recorded.
+It serves three purposes:
+1. **Feed the context builder** with history for SCS-style conditioning
+2. **Enable analysis** of what works and what doesn't
+3. **Provide audit trail** for human review
 
-## Purpose
+## Attempt record (simplified)
 
-1. **Prevent re-exploration** of failed paths
-2. **Enable learning** which strategies/intents/granularities work
-3. **Audit trail** for human review
-4. **Reproducibility** for any result
-5. **Feed the selector** with historical performance data
+One JSONL record per candidate:
 
-## Attempt record schema
+```json
+{
+  "attempt_id": "uuid",
+  "experiment_id": "exp-001",
+  "iteration": 7,
+  "timestamp": "2025-02-21T10:23:00Z",
 
-One record per candidate attempt:
+  "parent_attempt_id": "uuid-of-best-so-far",
+  "base_commit": "abc123",
+  "candidate_branch": "evo/exp-001/iter-7/cand-3",
 
-```yaml
-# Identity
-attempt_id: "uuid"
-experiment_id: "exp-001"
-iteration: 7
-timestamp: "2024-01-15T10:23:00Z"
+  "files_changed": ["src/engine.py", "src/cache.py"],
+  "loc_added": 45,
+  "loc_removed": 12,
+  "diff_ref": "archive/exp-001/diffs/iter-7-cand-3.patch",
 
-# Lineage
-parent_attempt_id: "uuid-of-parent"
-base_commit: "abc123"
-candidate_commit: "def456"
-branch: "evo/exp-001/iter-7/candidate-3"
+  "tier_results": [
+    {"tier": 0, "status": "pass", "duration_s": 2.1},
+    {"tier": 1, "status": "pass", "duration_s": 18.4,
+     "metrics": {"tests_passed": 142, "tests_failed": 0}},
+    {"tier": 2, "status": "pass", "duration_s": 120.0,
+     "metrics": {"throughput_rps": 1250, "p95_ms": 42.1}}
+  ],
 
-# Generation context
-agent_strategy: "aggressive_perf"
-patch_intent: "perf"
-patch_granularity: "M"
-prompt_version: "v1.2"
+  "gates_passed": true,
+  "reward": 4.2,
+  "failure_reason": null,
 
-# Patch stats
-files_changed: ["src/engine.py", "src/cache.py"]
-loc_added: 45
-loc_removed: 12
-diff_ref: "archive/exp-001/iter-7/cand-3.patch"
-
-# Evaluation results (per tier)
-tier_results:
-  - tier: 0
-    status: "pass"
-    duration_seconds: 2.1
-    checks: { lint: pass, build: pass, policy: pass }
-  - tier: 1
-    status: "pass"
-    duration_seconds: 18.4
-    checks: { unit_tests: pass, typecheck: pass }
-    metrics: { tests_passed: 142, coverage_delta: +0.3 }
-  - tier: 2
-    status: "pass"
-    duration_seconds: 120.0
-    metrics: { throughput_rps: 1250, p95_ms: 42.1, memory_mb: 312 }
-
-# Scoring
-gates_passed: true
-reward_breakdown:
-  correctness: 100.0
-  performance: 12.5
-  patch_size_penalty: -3.2
-  total: 109.3
-failure_reason: null  # or "tier_1_unit_test_failure"
-
-# Cost
-cost:
-  tokens_input: 15000
-  tokens_output: 3200
-  api_cost_usd: 0.08
-  compute_seconds: 140.5
-
-# Status
-promotion_status: "frontier"  # or "rejected", "finalist", "promoted"
-logs_ref: "archive/exp-001/iter-7/cand-3/logs/"
+  "cost": {
+    "tokens_input": 15000,
+    "tokens_output": 3200,
+    "api_cost_usd": 0.08,
+    "eval_duration_s": 140.5
+  }
+}
 ```
 
-## Storage strategy
+## What we cut from the original schema
 
-### v1: Simple file-based
-- JSONL file per experiment (`archive/exp-001/attempts.jsonl`)
-- Patch diffs stored as files (`archive/exp-001/diffs/`)
-- Logs stored as files (`archive/exp-001/logs/`)
-- SQLite index for queries
+- `agent_strategy`, `patch_intent`, `patch_granularity` - not prescribed in v1
+- `prompt_version`, `constraints_version` - tracked via experiment config, not per-attempt
+- `promotion_status` - replaced by simple `gates_passed` + `reward`
+- `novelty_features` - v2+ concern (MAP-Elites)
+- Separate `reward_breakdown` - single reward number is enough for v1
 
-### v2: Structured DB
-- PostgreSQL for attempt records
-- Object storage for large artifacts (logs, diffs)
-- Queryable metrics history
+## Storage
 
-Start with v1. It's grep-friendly and debuggable.
+### v1: Files on disk
 
-## Reproducibility metadata
+```
+archive/
+  exp-001/
+    config.yaml          # experiment configuration (frozen at start)
+    baseline.json        # baseline calibration results
+    attempts.jsonl       # one line per attempt
+    diffs/               # patch files
+      iter-1-cand-1.patch
+      iter-1-cand-2.patch
+      ...
+    logs/                # evaluation logs (optional, prunable)
+      iter-1-cand-1/
+        tier0.log
+        tier1.log
+        tier2.log
+```
 
-Every experiment run pins:
+JSONL is grep-friendly, append-only, and trivially debuggable.
+No database needed until you have thousands of attempts.
+
+## Reproducibility
+
+Every experiment pins:
 
 ```yaml
 reproducibility:
   base_commit: "abc123"
   dependency_lockfile_hash: "sha256:..."
-  container_image: "codevolution/eval:v1.0@sha256:..."
-  benchmark_dataset_version: "v2.1"
-  hardware_class: "4cpu-8gb"  # if perf matters
-  env_vars_hash: "sha256:..."  # sanitized, no secrets
+  eval_script_hash: "sha256:..."
 ```
 
-Without this, comparing results across runs is meaningless.
+Stored once in `config.yaml`, not per-attempt.
 
-## Retention policy
+## Key queries the archive should support
 
-- **All attempt records**: kept indefinitely (they're small)
-- **Diffs for frontier/promoted**: kept indefinitely
-- **Diffs for rejected**: kept for N days, then prunable
-- **Full logs**: kept for N days, summaries kept indefinitely
-- **Evaluation artifacts**: kept for frontier, prunable for rejected
+- "What's the best reward so far?" → sort attempts.jsonl by reward
+- "What failed and why?" → filter by failure_reason != null
+- "How is reward trending?" → plot reward over iterations
+- "What files get changed most?" → aggregate files_changed
+- "What's the total cost?" → sum cost fields
 
-## Queryable dimensions
-
-The archive should support queries like:
-- "Show top 10 attempts by reward for experiment X"
-- "Which strategies produced the most frontier candidates?"
-- "What's the failure rate by patch granularity?"
-- "Show all attempts that touched file Y"
-- "What's the reward trend over iterations?"
-
-These drive the selector and human understanding of the process.
+In v1, these are `jq` one-liners over the JSONL file.

@@ -45,26 +45,20 @@ Every candidate is evaluated in an isolated environment:
 
 The candidate cannot influence the evaluation environment.
 
-## Holdout evaluation (anti-overfitting)
+## Holdout evaluation (v2+ anti-overfitting)
 
-Tier 3 includes a holdout set that the system doesn't see during optimization:
+When added, holdout includes checks the system doesn't see during optimization:
 
 - Different test inputs
 - Different benchmark scenarios
 - Metrics computed differently
 
-If a candidate scores well on regular tiers but poorly on holdout,
-it's likely overfitting to the evaluation setup.
-
-**Holdout details are not in the agent's context.**
-The agent doesn't know what the holdout tests or how they differ.
+In v1, human review serves as the holdout function.
 
 ## Human-gated promotion
 
 ```
-Frontier ──── auto (within experiment) ────> Top candidates
-     │
-     └── Human review required ────> Merge to main branch
+Experiment best ──── Human review required ────> Merge to main
 ```
 
 In v1, promotion to main requires human approval:
@@ -76,17 +70,11 @@ In v1, promotion to main requires human approval:
 Auto-promotion within the experiment frontier is fine.
 Auto-merge to main is not.
 
-## Audit logging
+## Audit trail
 
-Every action is logged:
-- What was generated
-- What was evaluated
-- What passed/failed and why
-- What was promoted and by whom
-- Budget consumption over time
-
-Logs are append-only and stored separately from the archive
-(the archive stores results, audit logs store the process).
+In v1, the archive IS the audit trail. Every attempt, its results,
+costs, and failure reasons are recorded in JSONL. Git history provides
+the rest. No separate audit logging system needed.
 
 ## Escalation triggers
 
@@ -99,7 +87,7 @@ The system should pause and notify a human when:
 | Unexpected evaluation failures | Pause + investigate |
 | Candidate attempts to modify eval code | Hard reject + flag |
 | All candidates in an iteration fail Tier 0 | Review generation strategy |
-| Frontier diversity drops to 1 (convergence) | Flag for review |
+| All candidates in 3 consecutive iterations produce similar patches | Flag for review |
 
 ## What we explicitly do NOT do (v1)
 
