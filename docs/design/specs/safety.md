@@ -1,0 +1,111 @@
+# Safety Spec
+
+A smart patch generator will find shortcuts if you leave doors open.
+This spec defines the guardrails that keep the system honest.
+
+## Threat model
+
+The "adversary" is not malicious - it's an optimizer doing exactly what you
+reward it for, which may not be what you intended. Classic Goodhart's Law.
+
+Concrete risks:
+- Disabling tests to avoid failures
+- Adding benchmark-specific conditionals
+- Swallowing exceptions to hide errors
+- Gaming metrics without real improvement
+- Huge rewrites that happen to score well but are unmaintainable
+- Editing the evaluation infrastructure itself
+
+## Patch policy checks (static, pre-evaluation)
+
+Reject patches that:
+
+| Check | What it catches |
+|-------|----------------|
+| Disabled tests | `@skip`, `@pytest.mark.skip`, `.only`, commented-out tests |
+| Weakened assertions | Removed asserts, loosened thresholds |
+| Benchmark conditionals | `if benchmark_mode:`, `if os.environ.get('BENCH')` |
+| Swallowed exceptions | Bare `except: pass`, `|| true`, empty catch blocks |
+| Eval infrastructure edits | Changes to evaluator code, reward config, CI scripts |
+| Removed logging | Deleted log statements used by evaluators |
+| Forbidden file edits | Anything outside experiment scope |
+
+These are cheap regex/AST checks that run in Tier 0.
+
+## Evaluation isolation
+
+Every candidate is evaluated in an isolated environment:
+
+- **Clean worktree**: fresh `git worktree` or clone, not the working directory
+- **Container isolation**: Docker/OCI container with resource limits
+- **No network**: unless explicitly required by the benchmark
+- **Deterministic seeds**: random seeds pinned where possible
+- **Resource limits**: CPU, memory, time caps per tier
+- **Read-only source**: candidate code is read-only during evaluation
+
+The candidate cannot influence the evaluation environment.
+
+## Holdout evaluation (anti-overfitting)
+
+Tier 3 includes a holdout set that the system doesn't see during optimization:
+
+- Different test inputs
+- Different benchmark scenarios
+- Metrics computed differently
+
+If a candidate scores well on regular tiers but poorly on holdout,
+it's likely overfitting to the evaluation setup.
+
+**Holdout details are not in the agent's context.**
+The agent doesn't know what the holdout tests or how they differ.
+
+## Human-gated promotion
+
+```
+Frontier ──── auto (within experiment) ────> Top candidates
+     │
+     └── Human review required ────> Merge to main branch
+```
+
+In v1, promotion to main requires human approval:
+- Review the diff
+- Review the metrics
+- Review the archive history (how did we get here?)
+- Optionally: run manual tests
+
+Auto-promotion within the experiment frontier is fine.
+Auto-merge to main is not.
+
+## Audit logging
+
+Every action is logged:
+- What was generated
+- What was evaluated
+- What passed/failed and why
+- What was promoted and by whom
+- Budget consumption over time
+
+Logs are append-only and stored separately from the archive
+(the archive stores results, audit logs store the process).
+
+## Escalation triggers
+
+The system should pause and notify a human when:
+
+| Trigger | Response |
+|---------|----------|
+| Reward plateau (5+ iterations) | Flag for review |
+| Budget > 80% consumed | Warning |
+| Unexpected evaluation failures | Pause + investigate |
+| Candidate attempts to modify eval code | Hard reject + flag |
+| All candidates in an iteration fail Tier 0 | Review generation strategy |
+| Frontier diversity drops to 1 (convergence) | Flag for review |
+
+## What we explicitly do NOT do (v1)
+
+- No auto-deployment
+- No auto-dependency upgrades
+- No modifications to CI/CD pipelines
+- No changes outside experiment scope
+- No network access during evaluation (unless benchmark requires it)
+- No execution of candidate code outside the eval sandbox
