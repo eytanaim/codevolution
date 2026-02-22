@@ -6,7 +6,7 @@ import sys
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, Future
 from typing import Optional
 
 from .archive import init_archive, load_archive_state, load_baseline, save_attempt, save_baseline, save_candidate_files
@@ -151,6 +151,8 @@ def run_experiment(config: ExperimentConfig) -> Optional[AttemptRecord]:
     """Run the full SCS experiment loop.
 
     Returns the best attempt record, or None if no successful attempt.
+    Uses a sliding window of concurrent workers — as soon as one finishes,
+    a new one is submitted, keeping all worker slots full.
     """
     archive_path = init_archive(config.archive_dir)
     _log(f"Experiment {config.experiment_id} starting")
@@ -166,58 +168,64 @@ def run_experiment(config: ExperimentConfig) -> Optional[AttemptRecord]:
     else:
         _log(f"Loaded existing baseline: {baseline_record.metrics_mean}")
 
-    # Step 2: Main loop
+    # Step 2: Main loop — sliding window of workers
     start_time = time.monotonic()
     archive_state = load_archive_state(config.archive_dir, config.target_metric, config.metric_direction)
     archive_lock = threading.Lock()
 
     workers = config.budget.max_candidates_per_iteration
     max_iterations = config.budget.max_iterations
+    next_iteration = 0
+    completed_count = 0
 
-    for batch_start in range(0, max_iterations, workers):
-        # Budget check at batch start
-        budget_reason = _check_budget(config, batch_start, archive_state.total_cost_usd, start_time)
-        if budget_reason:
-            _log(f"Budget exhausted: {budget_reason}")
-            break
+    _log(f"Running up to {max_iterations} iterations with {workers} concurrent workers")
 
-        # Reload archive state at batch start
-        archive_state = load_archive_state(config.archive_dir, config.target_metric, config.metric_direction)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        in_flight: dict[Future, int] = {}
 
-        remaining = max_iterations - batch_start
-        batch_size = min(workers, remaining)
+        # Seed the pool
+        while next_iteration < max_iterations and len(in_flight) < workers:
+            archive_state = load_archive_state(config.archive_dir, config.target_metric, config.metric_direction)
+            budget_reason = _check_budget(config, next_iteration, archive_state.total_cost_usd, start_time)
+            if budget_reason:
+                _log(f"Budget exhausted: {budget_reason}")
+                break
+            future = pool.submit(
+                _run_single_attempt, config, baseline_record, archive_state, next_iteration, archive_lock,
+            )
+            in_flight[future] = next_iteration
+            _log(f"[iter {next_iteration}] Submitted (in-flight: {len(in_flight)})")
+            next_iteration += 1
 
-        _log(f"--- Batch {batch_start // workers + 1}: iterations {batch_start + 1}-{batch_start + batch_size} (workers={batch_size}) ---")
+        # Process completions and refill
+        while in_flight:
+            # Wait for the next completion
+            done_iter = next(as_completed(in_flight))
+            iteration = in_flight.pop(done_iter)
+            try:
+                record = done_iter.result()
+                status = "PASS" if record.all_tiers_passed else "FAIL"
+                _log(f"[iter {iteration}] Completed: {status} (reward={record.reward:.2f})")
+            except Exception as exc:
+                _log(f"[iter {iteration}] Exception: {exc}")
+            completed_count += 1
 
-        if batch_size == 1:
-            # Single worker — skip thread pool overhead
-            record = _run_single_attempt(config, baseline_record, archive_state, batch_start, archive_lock)
-            results = [record]
-        else:
-            results = []
-            with ThreadPoolExecutor(max_workers=batch_size) as pool:
-                futures = {
-                    pool.submit(
-                        _run_single_attempt, config, baseline_record, archive_state, batch_start + i, archive_lock
-                    ): batch_start + i
-                    for i in range(batch_size)
-                }
-                for future in as_completed(futures):
-                    iteration = futures[future]
-                    try:
-                        record = future.result()
-                        results.append(record)
-                    except Exception as exc:
-                        _log(f"[iter {iteration}] Exception: {exc}")
-
-        # Log batch summary
-        passed = sum(1 for r in results if r.all_tiers_passed)
-        _log(f"Batch done: {len(results)} attempts, {passed} passed")
-
-        # Reload archive after batch
-        archive_state = load_archive_state(config.archive_dir, config.target_metric, config.metric_direction)
+            # Submit next if budget allows
+            if next_iteration < max_iterations:
+                archive_state = load_archive_state(config.archive_dir, config.target_metric, config.metric_direction)
+                budget_reason = _check_budget(config, next_iteration, archive_state.total_cost_usd, start_time)
+                if budget_reason:
+                    _log(f"Budget exhausted: {budget_reason} — draining {len(in_flight)} in-flight workers")
+                else:
+                    future = pool.submit(
+                        _run_single_attempt, config, baseline_record, archive_state, next_iteration, archive_lock,
+                    )
+                    in_flight[future] = next_iteration
+                    _log(f"[iter {next_iteration}] Submitted (in-flight: {len(in_flight)})")
+                    next_iteration += 1
 
     # Report
+    archive_state = load_archive_state(config.archive_dir, config.target_metric, config.metric_direction)
     _log("--- Experiment Complete ---")
     _log(f"Total attempts: {len(archive_state.attempts)}")
     _log(f"Total cost: ${archive_state.total_cost_usd:.2f}")

@@ -160,7 +160,7 @@ def load_config(path: str | Path) -> ExperimentConfig:
     budget_raw = raw.get("budget", {})
     budget = BudgetConfig(
         max_iterations=budget_raw.get("max_iterations", 20),
-        max_candidates_per_iteration=budget_raw.get("max_candidates_per_iteration", 1),
+        max_candidates_per_iteration=budget_raw.get("max_candidates_per_iteration", 3),
         max_wall_clock_hours=budget_raw.get("max_wall_clock_hours", 4.0),
         max_api_cost_usd=budget_raw.get("max_api_cost_usd", 50.0),
     )
