@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import time
@@ -87,6 +88,9 @@ def invoke(
     if system_context:
         full_prompt = f"{system_context}\n\n---\n\n{full_prompt}"
 
+    # Strip CLAUDECODE env var to allow nested invocations
+    env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+
     start = time.monotonic()
     try:
         proc = subprocess.run(
@@ -96,6 +100,7 @@ def invoke(
             capture_output=True,
             text=True,
             timeout=600,  # 10 min hard timeout
+            env=env,
         )
         raw_output = proc.stdout
         error = proc.stderr if proc.returncode != 0 else ""
