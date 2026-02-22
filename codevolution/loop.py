@@ -118,21 +118,7 @@ def run_experiment(config: ExperimentConfig) -> Optional[AttemptRecord]:
                 continue
 
             if loc_delta > config.scope.max_loc_delta:
-                _log(f"Too many lines changed: {loc_delta} > {config.scope.max_loc_delta}")
-                record = AttemptRecord(
-                    attempt_id=attempt_id,
-                    iteration=iteration,
-                    diff_stat=claude_result.diff_stat,
-                    total_added=claude_result.total_added,
-                    total_removed=claude_result.total_removed,
-                    cost=claude_result.cost,
-                    failure_reason="scope: too many lines changed",
-                )
-                save_attempt(config.archive_dir, record)
-                archive_state = load_archive_state(
-                    config.archive_dir, config.target_metric, config.metric_direction
-                )
-                continue
+                _log(f"LOC over target: {loc_delta} > {config.scope.max_loc_delta} (penalty applies)")
 
             # Evaluate
             _log("Running evaluation pipeline...")
@@ -151,6 +137,7 @@ def run_experiment(config: ExperimentConfig) -> Optional[AttemptRecord]:
                     config.metric_direction,
                     loc_delta,
                     config.reward.patch_size_penalty,
+                    config.scope.max_loc_delta,
                 )
 
             failure_reason = ""

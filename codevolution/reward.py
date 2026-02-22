@@ -94,11 +94,13 @@ def compute_reward(
     direction: str,
     loc_delta: int,
     patch_size_penalty: float,
+    max_loc_delta: int = 0,
 ) -> float:
-    """Compute scalar reward: improvement_pct - (penalty * loc_delta).
+    """Compute scalar reward: improvement_pct - patch_penalty - overflow_penalty.
 
     improvement_pct is relative to baseline mean for the target metric.
     direction: "higher" means larger values are better, "lower" means smaller.
+    Lines over max_loc_delta get penalized at 10x the base rate.
     """
     baseline_value = baseline.metrics_mean.get(target_metric)
     current_value = metrics.get(target_metric)
@@ -122,4 +124,8 @@ def compute_reward(
             improvement_pct = ((baseline_value - current_value) / abs(baseline_value)) * 100.0
 
     penalty = patch_size_penalty * abs(loc_delta)
+    # Lines over the limit get a steep additional penalty (10x base rate)
+    if max_loc_delta > 0 and abs(loc_delta) > max_loc_delta:
+        overflow = abs(loc_delta) - max_loc_delta
+        penalty += patch_size_penalty * 10 * overflow
     return round(improvement_pct - penalty, 4)

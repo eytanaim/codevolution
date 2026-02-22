@@ -122,6 +122,51 @@ def test_compute_reward_zero_baseline():
     assert reward == 100.0
 
 
+def test_compute_reward_loc_overflow_penalty():
+    baseline = BaselineRecord(metrics_mean={"rps": 100.0})
+    # Under limit: normal penalty only
+    reward_under = compute_reward(
+        metrics={"rps": 150.0},
+        baseline=baseline,
+        target_metric="rps",
+        direction="higher",
+        loc_delta=400,
+        patch_size_penalty=0.01,
+        max_loc_delta=500,
+    )
+    # improvement = 50%, penalty = 0.01*400 = 4.0
+    assert reward_under == 50.0 - 4.0
+
+    # Over limit by 20: base penalty + 10x overflow penalty
+    reward_over = compute_reward(
+        metrics={"rps": 150.0},
+        baseline=baseline,
+        target_metric="rps",
+        direction="higher",
+        loc_delta=520,
+        patch_size_penalty=0.01,
+        max_loc_delta=500,
+    )
+    # improvement = 50%, base penalty = 0.01*520 = 5.2, overflow = 0.01*10*20 = 2.0
+    assert reward_over == 50.0 - 5.2 - 2.0
+
+
+def test_compute_reward_no_overflow_when_no_limit():
+    baseline = BaselineRecord(metrics_mean={"rps": 100.0})
+    # max_loc_delta=0 means no overflow penalty
+    reward = compute_reward(
+        metrics={"rps": 150.0},
+        baseline=baseline,
+        target_metric="rps",
+        direction="higher",
+        loc_delta=600,
+        patch_size_penalty=0.01,
+        max_loc_delta=0,
+    )
+    # improvement = 50%, penalty = 0.01*600 = 6.0, no overflow
+    assert reward == 50.0 - 6.0
+
+
 def test_all_condition_operators():
     results = [_tier_result(0, metrics={"x": 5.0})]
 

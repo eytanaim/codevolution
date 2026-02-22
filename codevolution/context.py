@@ -54,7 +54,10 @@ def build_prompt(
     if config.scope.forbidden_paths:
         system_parts.append(f"Forbidden paths (do NOT modify): {', '.join(config.scope.forbidden_paths)}")
     system_parts.append(f"Max files to change: {config.scope.max_files_changed}")
-    system_parts.append(f"Max lines changed: {config.scope.max_loc_delta}")
+    system_parts.append(
+        f"Target max lines changed: {config.scope.max_loc_delta} "
+        f"(exceeding this incurs a steep score penalty)"
+    )
 
     # Prompt: goal + baseline + archive feedback + action request
     prompt_parts.append(f"# Goal\n{config.goal}")
