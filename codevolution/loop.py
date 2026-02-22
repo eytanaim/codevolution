@@ -3,18 +3,20 @@
 from __future__ import annotations
 
 import sys
+import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 
-from .archive import init_archive, load_archive_state, load_baseline, save_attempt, save_baseline
+from .archive import init_archive, load_archive_state, load_baseline, save_attempt, save_baseline, save_candidate_files
 from .baseline import calibrate
 from .claude import invoke
 from .config import ExperimentConfig
 from .context import build_prompt
 from .evaluate import run_all_tiers
 from .reward import check_gates, compute_reward
-from .types import AttemptRecord, BaselineRecord
+from .types import ArchiveState, AttemptRecord, BaselineRecord
 from .worktree import cleanup_worktree, create_worktree
 
 
@@ -39,6 +41,112 @@ def _check_budget(
     return None
 
 
+def _run_single_attempt(
+    config: ExperimentConfig,
+    baseline_record: BaselineRecord,
+    archive_state: ArchiveState,
+    iteration: int,
+    archive_lock: threading.Lock,
+) -> AttemptRecord:
+    """Run a single iteration: worktree -> invoke -> evaluate -> save."""
+    worktree = create_worktree(config.target_repo, config.base_commit, f"iter-{iteration}-{uuid.uuid4().hex[:4]}")
+    try:
+        prompt, system_context = build_prompt(config, baseline_record, archive_state)
+
+        _log(f"[iter {iteration}] Invoking claude...")
+        claude_result = invoke(prompt, system_context, worktree, config.claude)
+
+        attempt_id = str(uuid.uuid4())[:8]
+
+        if not claude_result.success:
+            _log(f"[iter {iteration}] Claude failed: {claude_result.error}")
+            record = AttemptRecord(
+                attempt_id=attempt_id,
+                iteration=iteration,
+                cost=claude_result.cost,
+                failure_reason=f"claude error: {claude_result.error}",
+            )
+            with archive_lock:
+                save_attempt(config.archive_dir, record)
+            return record
+
+        # Check scope limits
+        loc_delta = claude_result.total_added + claude_result.total_removed
+        if len(claude_result.diff_stat) > config.scope.max_files_changed:
+            _log(f"[iter {iteration}] Too many files changed: {len(claude_result.diff_stat)} > {config.scope.max_files_changed}")
+            record = AttemptRecord(
+                attempt_id=attempt_id,
+                iteration=iteration,
+                diff_stat=claude_result.diff_stat,
+                total_added=claude_result.total_added,
+                total_removed=claude_result.total_removed,
+                cost=claude_result.cost,
+                failure_reason="scope: too many files changed",
+            )
+            with archive_lock:
+                save_attempt(config.archive_dir, record)
+            return record
+
+        if loc_delta > config.scope.max_loc_delta:
+            _log(f"[iter {iteration}] LOC over target: {loc_delta} > {config.scope.max_loc_delta} (penalty applies)")
+
+        # Evaluate
+        _log(f"[iter {iteration}] Running evaluation pipeline...")
+        tier_results, merged_metrics, all_tiers_passed = run_all_tiers(config.tiers, worktree)
+
+        # Check gates
+        gates_passed, gate_failure = check_gates(tier_results, config.gates)
+
+        # Compute reward
+        reward = 0.0
+        if gates_passed and all_tiers_passed:
+            reward = compute_reward(
+                merged_metrics,
+                baseline_record,
+                config.target_metric,
+                config.metric_direction,
+                loc_delta,
+                config.reward.patch_size_penalty,
+                config.scope.max_loc_delta,
+            )
+
+        failure_reason = ""
+        if not all_tiers_passed:
+            failed_steps = [r.step_name for r in tier_results if not r.passed]
+            failure_reason = f"eval failed: {failed_steps}"
+        elif not gates_passed:
+            failure_reason = f"gate failed: {gate_failure}"
+
+        record = AttemptRecord(
+            attempt_id=attempt_id,
+            iteration=iteration,
+            tier_results=tier_results,
+            all_tiers_passed=all_tiers_passed and gates_passed,
+            reward=reward,
+            diff_stat=claude_result.diff_stat,
+            total_added=claude_result.total_added,
+            total_removed=claude_result.total_removed,
+            cost=claude_result.cost,
+            failure_reason=failure_reason,
+            metrics=merged_metrics,
+        )
+
+        with archive_lock:
+            save_attempt(config.archive_dir, record)
+            if record.all_tiers_passed:
+                candidate_dir = save_candidate_files(
+                    config.archive_dir, attempt_id, worktree, claude_result.diff_stat
+                )
+                _log(f"[iter {iteration}] SUCCESS: reward={reward:.2f}, metrics={merged_metrics}")
+                _log(f"[iter {iteration}] Candidate files saved to {candidate_dir}")
+            else:
+                _log(f"[iter {iteration}] FAILED: {failure_reason}")
+
+        return record
+    finally:
+        cleanup_worktree(config.target_repo, worktree)
+
+
 def run_experiment(config: ExperimentConfig) -> Optional[AttemptRecord]:
     """Run the full SCS experiment loop.
 
@@ -61,118 +169,53 @@ def run_experiment(config: ExperimentConfig) -> Optional[AttemptRecord]:
     # Step 2: Main loop
     start_time = time.monotonic()
     archive_state = load_archive_state(config.archive_dir, config.target_metric, config.metric_direction)
+    archive_lock = threading.Lock()
 
-    for iteration in range(config.budget.max_iterations):
-        # Budget check
-        budget_reason = _check_budget(config, iteration, archive_state.total_cost_usd, start_time)
+    workers = config.budget.max_candidates_per_iteration
+    max_iterations = config.budget.max_iterations
+
+    for batch_start in range(0, max_iterations, workers):
+        # Budget check at batch start
+        budget_reason = _check_budget(config, batch_start, archive_state.total_cost_usd, start_time)
         if budget_reason:
             _log(f"Budget exhausted: {budget_reason}")
             break
 
-        _log(f"--- Iteration {iteration + 1}/{config.budget.max_iterations} ---")
+        # Reload archive state at batch start
+        archive_state = load_archive_state(config.archive_dir, config.target_metric, config.metric_direction)
 
-        # Build prompt
-        prompt, system_context = build_prompt(config, baseline_record, archive_state)
+        remaining = max_iterations - batch_start
+        batch_size = min(workers, remaining)
 
-        # Create worktree
-        worktree = create_worktree(config.target_repo, config.base_commit, f"iter-{iteration}")
+        _log(f"--- Batch {batch_start // workers + 1}: iterations {batch_start + 1}-{batch_start + batch_size} (workers={batch_size}) ---")
 
-        try:
-            # Invoke claude
-            _log("Invoking claude...")
-            claude_result = invoke(prompt, system_context, worktree, config.claude)
+        if batch_size == 1:
+            # Single worker — skip thread pool overhead
+            record = _run_single_attempt(config, baseline_record, archive_state, batch_start, archive_lock)
+            results = [record]
+        else:
+            results = []
+            with ThreadPoolExecutor(max_workers=batch_size) as pool:
+                futures = {
+                    pool.submit(
+                        _run_single_attempt, config, baseline_record, archive_state, batch_start + i, archive_lock
+                    ): batch_start + i
+                    for i in range(batch_size)
+                }
+                for future in as_completed(futures):
+                    iteration = futures[future]
+                    try:
+                        record = future.result()
+                        results.append(record)
+                    except Exception as exc:
+                        _log(f"[iter {iteration}] Exception: {exc}")
 
-            attempt_id = str(uuid.uuid4())[:8]
+        # Log batch summary
+        passed = sum(1 for r in results if r.all_tiers_passed)
+        _log(f"Batch done: {len(results)} attempts, {passed} passed")
 
-            if not claude_result.success:
-                _log(f"Claude failed: {claude_result.error}")
-                record = AttemptRecord(
-                    attempt_id=attempt_id,
-                    iteration=iteration,
-                    cost=claude_result.cost,
-                    failure_reason=f"claude error: {claude_result.error}",
-                )
-                save_attempt(config.archive_dir, record)
-                archive_state = load_archive_state(
-                    config.archive_dir, config.target_metric, config.metric_direction
-                )
-                continue
-
-            # Check scope limits
-            loc_delta = claude_result.total_added + claude_result.total_removed
-            if len(claude_result.diff_stat) > config.scope.max_files_changed:
-                _log(f"Too many files changed: {len(claude_result.diff_stat)} > {config.scope.max_files_changed}")
-                record = AttemptRecord(
-                    attempt_id=attempt_id,
-                    iteration=iteration,
-                    diff_stat=claude_result.diff_stat,
-                    total_added=claude_result.total_added,
-                    total_removed=claude_result.total_removed,
-                    cost=claude_result.cost,
-                    failure_reason="scope: too many files changed",
-                )
-                save_attempt(config.archive_dir, record)
-                archive_state = load_archive_state(
-                    config.archive_dir, config.target_metric, config.metric_direction
-                )
-                continue
-
-            if loc_delta > config.scope.max_loc_delta:
-                _log(f"LOC over target: {loc_delta} > {config.scope.max_loc_delta} (penalty applies)")
-
-            # Evaluate
-            _log("Running evaluation pipeline...")
-            tier_results, merged_metrics, all_tiers_passed = run_all_tiers(config.tiers, worktree)
-
-            # Check gates
-            gates_passed, gate_failure = check_gates(tier_results, config.gates)
-
-            # Compute reward
-            reward = 0.0
-            if gates_passed and all_tiers_passed:
-                reward = compute_reward(
-                    merged_metrics,
-                    baseline_record,
-                    config.target_metric,
-                    config.metric_direction,
-                    loc_delta,
-                    config.reward.patch_size_penalty,
-                    config.scope.max_loc_delta,
-                )
-
-            failure_reason = ""
-            if not all_tiers_passed:
-                failed_steps = [r.step_name for r in tier_results if not r.passed]
-                failure_reason = f"eval failed: {failed_steps}"
-            elif not gates_passed:
-                failure_reason = f"gate failed: {gate_failure}"
-
-            record = AttemptRecord(
-                attempt_id=attempt_id,
-                iteration=iteration,
-                tier_results=tier_results,
-                all_tiers_passed=all_tiers_passed and gates_passed,
-                reward=reward,
-                diff_stat=claude_result.diff_stat,
-                total_added=claude_result.total_added,
-                total_removed=claude_result.total_removed,
-                cost=claude_result.cost,
-                failure_reason=failure_reason,
-                metrics=merged_metrics,
-            )
-
-            save_attempt(config.archive_dir, record)
-            archive_state = load_archive_state(
-                config.archive_dir, config.target_metric, config.metric_direction
-            )
-
-            if record.all_tiers_passed:
-                _log(f"SUCCESS: reward={reward:.2f}, metrics={merged_metrics}")
-            else:
-                _log(f"FAILED: {failure_reason}")
-
-        finally:
-            cleanup_worktree(config.target_repo, worktree)
+        # Reload archive after batch
+        archive_state = load_archive_state(config.archive_dir, config.target_metric, config.metric_direction)
 
     # Report
     _log("--- Experiment Complete ---")

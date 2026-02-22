@@ -36,7 +36,7 @@ class RewardConfig:
 @dataclass
 class BudgetConfig:
     max_iterations: int = 20
-    max_candidates_per_iteration: int = 1
+    max_candidates_per_iteration: int = 3
     max_wall_clock_hours: float = 4.0
     max_api_cost_usd: float = 50.0
 

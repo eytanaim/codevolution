@@ -9,6 +9,7 @@ from codevolution.archive import (
     load_baseline,
     save_attempt,
     save_baseline,
+    save_candidate_files,
 )
 from codevolution.types import AttemptRecord, BaselineRecord, CostRecord, TierResult
 
@@ -146,3 +147,40 @@ def test_diff_stat_roundtrip():
 
     state = load_archive_state(archive, "rps", "higher")
     assert state.attempts[0].diff_stat["src/fib.py"] == (5, 3)
+
+
+def test_save_candidate_files_copies_and_preserves_structure():
+    archive = _tmp_archive()
+    init_archive(archive)
+
+    # Create a fake worktree with modified files
+    worktree = Path(tempfile.mkdtemp(prefix="codevolution-test-wt-"))
+    (worktree / "src").mkdir()
+    (worktree / "src" / "fib.py").write_text("def fib(n): return n")
+    (worktree / "util").mkdir()
+    (worktree / "util" / "helpers.py").write_text("CONST = 1")
+
+    diff_stat = {"src/fib.py": (5, 3), "util/helpers.py": (2, 0)}
+
+    result = save_candidate_files(archive, "abc123", worktree, diff_stat)
+
+    assert result == archive / "candidates" / "abc123"
+    assert (result / "src" / "fib.py").read_text() == "def fib(n): return n"
+    assert (result / "util" / "helpers.py").read_text() == "CONST = 1"
+
+
+def test_save_candidate_files_skips_deleted_files():
+    archive = _tmp_archive()
+    init_archive(archive)
+
+    worktree = Path(tempfile.mkdtemp(prefix="codevolution-test-wt-"))
+    (worktree / "src").mkdir()
+    (worktree / "src" / "kept.py").write_text("kept")
+
+    # "deleted.py" is in diff_stat but doesn't exist on disk
+    diff_stat = {"src/kept.py": (1, 0), "src/deleted.py": (0, 10)}
+
+    result = save_candidate_files(archive, "def456", worktree, diff_stat)
+
+    assert (result / "src" / "kept.py").exists()
+    assert not (result / "src" / "deleted.py").exists()

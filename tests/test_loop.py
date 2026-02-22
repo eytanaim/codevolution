@@ -19,7 +19,7 @@ from codevolution.loop import _check_budget, run_experiment
 from codevolution.types import ClaudeResult, CostRecord
 
 
-def _make_config(target_repo: str, archive_dir: str, max_iterations: int = 1) -> ExperimentConfig:
+def _make_config(target_repo: str, archive_dir: str, max_iterations: int = 1, max_candidates: int = 1) -> ExperimentConfig:
     return ExperimentConfig(
         experiment_id="test-loop",
         target_repo=target_repo,
@@ -46,6 +46,7 @@ def _make_config(target_repo: str, archive_dir: str, max_iterations: int = 1) ->
         reward=RewardConfig(patch_size_penalty=0.01),
         budget=BudgetConfig(
             max_iterations=max_iterations,
+            max_candidates_per_iteration=max_candidates,
             max_api_cost_usd=50.0,
             max_wall_clock_hours=1.0,
         ),
@@ -134,3 +135,23 @@ def test_loop_scope_violation(mock_invoke, toy_repo):
     )
 
     result = run_experiment(config)
+
+
+@patch("codevolution.loop.invoke")
+def test_loop_parallel_workers(mock_invoke, toy_repo):
+    """Test that multiple workers run when max_candidates_per_iteration > 1."""
+    archive_dir = tempfile.mkdtemp(prefix="codevolution-test-parallel-")
+    config = _make_config(str(toy_repo), archive_dir, max_iterations=3, max_candidates=3)
+
+    mock_invoke.return_value = ClaudeResult(
+        success=True,
+        diff_stat={},
+        total_added=0,
+        total_removed=0,
+        cost=CostRecord(api_cost_usd=0.01, duration_s=1.0),
+        raw_output="{}",
+    )
+
+    result = run_experiment(config)
+    # All 3 iterations should run in a single batch
+    assert mock_invoke.call_count == 3

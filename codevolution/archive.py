@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from dataclasses import asdict
 from pathlib import Path
 from typing import Optional
@@ -24,6 +25,29 @@ def _serialize(obj: object) -> str:
 def _append_jsonl(filepath: Path, data: str) -> None:
     with open(filepath, "a") as f:
         f.write(data + "\n")
+
+
+def save_candidate_files(
+    archive_dir: str | Path,
+    attempt_id: str,
+    worktree: str | Path,
+    diff_stat: dict[str, tuple[int, int]],
+) -> Path:
+    """Copy modified files from the worktree into the archive.
+
+    Preserves directory structure under {archive_dir}/candidates/{attempt_id}/.
+    Returns the candidate directory path.
+    """
+    candidate_dir = Path(archive_dir) / "candidates" / attempt_id
+    wt = Path(worktree)
+    for relpath in diff_stat:
+        src = wt / relpath
+        if not src.exists():
+            continue
+        dest = candidate_dir / relpath
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dest)
+    return candidate_dir
 
 
 def save_attempt(archive_dir: str | Path, record: AttemptRecord) -> None:

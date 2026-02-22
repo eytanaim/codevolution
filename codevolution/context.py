@@ -58,6 +58,10 @@ def build_prompt(
         f"Target max lines changed: {config.scope.max_loc_delta} "
         f"(exceeding this incurs a steep score penalty)"
     )
+    system_parts.append(
+        f"You have {config.claude.max_turns} turns to complete your work. "
+        f"Be direct and efficient — do not waste turns on exploration you don't need."
+    )
 
     # Prompt: goal + baseline + archive feedback + action request
     prompt_parts.append(f"# Goal\n{config.goal}")
